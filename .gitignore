@@ -14,3 +14,4 @@ env/
 
 # macOS
 .DS_Store
+/gitIgnore
