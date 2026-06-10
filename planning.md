@@ -15,19 +15,27 @@ You must have at least 3 tools. The three required tools are listed — add any 
 ### Tool 1: search_listings
 
 **What it does:**
-<!-- Describe what this tool does in 1–2 sentences -->
+Searches the 40 mock listings for items matching the user's request. It runs in two stages: first it applies hard filters (price ceiling and size) to drop listings that don't qualify, then it scores the survivors by keyword overlap with the description and returns them ranked best-match first. Pure Python — no LLM call.
 
 **Input parameters:**
-<!-- List each parameter, its type, and what it represents -->
-- `description` (str): ...
-- `size` (str): ...
-- `max_price` (float): ...
+- `description` (str): keywords describing the item the user wants (e.g. `"vintage graphic tee"`). Already stripped of price/size by the agent before it reaches this tool.
+- `size` (str | None): a size to filter by (e.g. `"M"`, `"small"`, `"US 7"`), or `None` to skip size filtering.
+- `max_price` (float | None): an inclusive price ceiling, or `None` to skip price filtering.
+
+**How matching works:**
+- **Price filter (hard):** keep a listing only if `price <= max_price`. Skipped if `max_price is None`.
+- **Size filter (hard):** keep a listing only if its size matches the request. Matching is normalize → token → wildcard:
+  1. *Normalize* the requested size: lowercase, strip, map words to letters (`small`→`s`, `medium`→`m`, `large`→`l`, `extra large`/`x-large`→`xl`).
+  2. *Token-match*: split the listing's size on non-alphanumeric characters (so `"S/M"` → `["s","m"]`, `"XL (oversized)"` → `["xl","oversized"]`) and keep the listing if the normalized request equals one of those tokens. (Token-match, not substring, so a request for `S` never matches `XL`/`oversized`/length codes like `L30`.)
+  3. *One-size wildcard*: if the listing size contains `one size`, `oversized`, or `adjustable`, it matches any requested size.
+  Skipped if `size is None`.
+- **Keyword scoring (rank):** on the listings that pass both filters, glue `title` + `style_tags` + `description` into one lowercased text blob. Split the description into words, drop words ≤2 letters, and score each listing by how many of those words appear as a **substring** of its blob (substring so `vintage` matches `vintage-style`). Drop any listing scoring 0.
 
 **What it returns:**
-<!-- Describe the return value — what fields does a result contain? -->
+A list of the full matching listing dicts — each with all 11 fields (`id, title, description, category, style_tags, size, condition, price, colors, brand, platform`) — sorted by keyword score, highest first. Ties keep dataset order (stable sort). Returns **all** scoring matches, not a top-N slice; the agent selects `results[0]`.
 
 **What happens if it fails or returns nothing:**
-<!-- What should the agent do if no listings match? -->
+Returns an empty list `[]` — it never raises. The agent checks for the empty list and stops early with a helpful message telling the user what to loosen (size, price, or keywords), rather than calling `suggest_outfit` with no item.
 
 ---
 
