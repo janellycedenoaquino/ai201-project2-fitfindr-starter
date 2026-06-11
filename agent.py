@@ -18,7 +18,79 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing (rule-based, no LLM) ──────────────────────────────────────────
+
+# Conversational filler dropped from the description so Tool 1's substring
+# keyword search doesn't misfire (e.g. "for" substring-matching "platform").
+_STOP_WORDS = {
+    "i", "im", "i'm", "a", "an", "the", "for", "looking", "look", "want",
+    "wanted", "need", "find", "finding", "me", "some", "something", "to",
+    "in", "of", "my", "please", "show", "get", "searching", "search", "buy",
+    "would", "like", "thats", "out", "there", "is", "are", "and",
+}
+
+# Known size tokens used to spot a bare size in the query when there is no
+# explicit "size X" phrase. Letter codes + spelled-out forms.
+_SIZE_TOKENS = {
+    "xxs", "xs", "s", "m", "l", "xl", "xxl",
+    "small", "medium", "large",
+}
+
+# Price patterns, tried in order; group 1 captures the numeric ceiling.
+_PRICE_PATTERNS = [
+    r"under\s*\$?\s*(\d+(?:\.\d+)?)",
+    r"below\s*\$?\s*(\d+(?:\.\d+)?)",
+    r"less\s+than\s*\$?\s*(\d+(?:\.\d+)?)",
+    r"max(?:imum)?\s*\$?\s*(\d+(?:\.\d+)?)",
+    r"\$\s*(\d+(?:\.\d+)?)",
+    r"(\d+(?:\.\d+)?)\s*dollars?",
+]
+
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract description / size / max_price from a raw query using regex only.
+
+    Returns a dict ready to splat into search_listings(): keys description (str),
+    size (str | None), max_price (float | None). No LLM call — deterministic,
+    unit-testable, and zero added latency.
+    """
+    text = query.lower()
+    max_price = None
+    size = None
+
+    # --- price: first matching pattern wins, then strip its phrase from text ---
+    for pat in _PRICE_PATTERNS:
+        m = re.search(pat, text)
+        if m:
+            max_price = float(m.group(1))
+            text = text[: m.start()] + " " + text[m.end():]
+            break
+
+    # --- size: explicit "size X" / "sz X" phrase, then strip it ---
+    m = re.search(r"\b(?:size|sz)\s+([a-z0-9]+)\b", text)
+    if m:
+        size = m.group(1).upper()
+        text = text[: m.start()] + " " + text[m.end():]
+
+    # --- description: drop stop words, leftover bare size token, stray numbers ---
+    kept: list[str] = []
+    for tok in re.findall(r"[a-z0-9']+", text):
+        if tok in _STOP_WORDS:
+            continue
+        if size is None and tok in _SIZE_TOKENS:
+            size = tok.upper()  # bare size token, no "size" keyword present
+            continue
+        if tok.isdigit():
+            continue  # leftover number that isn't a keyword
+        kept.append(tok)
+
+    return {"description": " ".join(kept), "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +164,48 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: fresh session — the single source of truth for this interaction.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the raw query into description / size / max_price (regex).
+    session["parsed"] = _parse_query(query)
+
+    # Step 3: search. The one real branch point — empty results end the run
+    # early so suggest_outfit is never called with no item.
+    results = search_listings(**session["parsed"])
+    session["search_results"] = results
+    if not results:
+        parsed = session["parsed"]
+        constraints = []
+        if parsed["size"]:
+            constraints.append(f"size {parsed['size']}")
+        if parsed["max_price"] is not None:
+            constraints.append(f"under ${parsed['max_price']:g}")
+        where = (" in " + " ".join(constraints)) if constraints else ""
+        target = parsed["description"] or query
+        session["error"] = (
+            f"No matches for '{target}'{where}. "
+            "Try removing the size or price filter, or using broader keywords."
+        )
+        return session
+
+    # Step 4: select the top-ranked match (search_listings returns sorted).
+    session["selected_item"] = results[0]
+
+    # Step 5: suggest an outfit (handles empty wardrobe internally).
+    session["outfit_suggestion"] = suggest_outfit(results[0], wardrobe)
+
+    # Step 6: light guard — skip the fit card if the outfit came back empty.
+    outfit = session["outfit_suggestion"]
+    if not outfit or not outfit.strip():
+        session["error"] = (
+            "Found a match but couldn't generate an outfit suggestion — "
+            "try again in a moment."
+        )
+        return session
+    session["fit_card"] = create_fit_card(outfit, results[0])
+
+    # Step 7: done.
     return session
 
 
